@@ -1,0 +1,299 @@
+# The shadow's recorder, every hour (docs/design.md). It records; it judges nothing.
+# The recorder is tools/shadow/src/recorder.ts of RECORDER_REPOSITORY at RECORDER_COMMIT, with its frozen watched
+# list; src/record.ts runs it for a bounded time. Its data lives on this repository's branch DATA_BRANCH, which this
+# workflow never creates: until the branch is seeded (docs/switch-over.md), every run fails at the checkout, and no
+# new shadow starts by accident.
+#
+# Two jobs:
+# - record: read-only token, no secret. Runs the recorder in Docker (node:24-slim by digest) for RECORD_SECONDS, then
+#   uploads what it wrote as an artifact. It is the only job that runs Node, and it runs no dependency code but semver,
+#   checked against the pinned commit's lockfile integrity. No package tarball is ever run or stored.
+# - write: may push to DATA_BRANCH only by what it does (the token can write contents). Runs no Node, npm or Docker:
+#   it checks the artifact's paths and file types, then commits and pushes it. It refuses a run whose data branch
+#   moved since the record job read it.
+# Pushes made with the workflow's token start no other workflow.
+name: shadow
+
+on:
+  schedule:
+    # Hourly, away from the top of the hour, when scheduled runs are most often delayed.
+    - cron: "17 * * * *"
+  # A run by hand, for the switch-over (docs/switch-over.md). It does the same as a scheduled run.
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time: the next run starts from the state this one commits.
+concurrency:
+  group: shadow
+  cancel-in-progress: false
+
+env:
+  DATA_BRANCH: shadow-data
+  RECORDER_REPOSITORY: Ludion-ai/ludion
+  RECORDER_COMMIT: 8a78b55940def8463a2401e7bdd38d7e6c7b604d
+  IMAGE: node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
+  # The whole data branch's files, uncompressed (the recorder's count). docs/estimate.md, "Storage".
+  MAX_BYTES: "3800000000"
+  # 50 minutes of polls each hour; the rest is setup, the commit, and the schedule's slack.
+  RECORD_SECONDS: "3000"
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      packed: ${{ steps.pack.outputs.packed }}
+      stamp: ${{ steps.pack.outputs.stamp }}
+      artifact: ${{ steps.pack.outputs.artifact }}
+      data_sha: ${{ steps.stored.outputs.data_sha }}
+    steps:
+      # The driver (src/record.ts) from this workflow's commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: shadow
+          persist-credentials: false
+          sparse-checkout: src
+
+      # The recorder and what it imports, at the pinned commit of the public Ludion repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.RECORDER_REPOSITORY }}
+          ref: ${{ env.RECORDER_COMMIT }}
+          path: app
+          persist-credentials: false
+          sparse-checkout: |
+            tools/shadow
+            tools/backtest/src
+            packages/cli/src/security
+
+      # state.json and known/ only; the earlier runs' files (runs/) are not downloaded.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DATA_BRANCH }}
+          path: data
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout: known
+
+      - name: Check the data branch and read the size of its runs
+        id: stored
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          data_sha=$(git -C data rev-parse HEAD)
+          # The branch must hold the seeded state and nothing else at its root: a branch without a feed position would
+          # start a second shadow, with a new feed start.
+          root=$(git -C data ls-tree --name-only HEAD | tr '\n' ' ')
+          if [ "$root" != "known runs state.json " ]; then
+            echo "::error::The data branch's root holds '${root}', not 'known runs state.json'."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.seq | type == "string") and (.feed_started_at | type == "string")' data/state.json > /dev/null; then
+            echo "::error::The data branch's state.json has no feed position and feed start."
+            exit 1
+          fi
+          # state.json and known/ are on disk and counted by the recorder; everything else is under runs/. Only that
+          # subtree is listed, which stays far under the listing's limits (100,000 entries, 7 MB).
+          runs=$(git -C data rev-parse "HEAD:runs")
+          # The recorder counts its data directory, so the repository stays out of it.
+          mv data/.git data.git
+          gh api "repos/${REPO}/git/trees/${runs}?recursive=1" > tree.json
+          if [ "$(jq -r '.truncated' tree.json)" != "false" ]; then
+            echo "::error::The listing of runs/ is truncated; its size cannot be counted."
+            exit 1
+          fi
+          stored=$(jq -r '[.tree[] | select(.type == "blob") | .size] | add // 0' tree.json)
+          echo "data_sha=${data_sha}" >> "$GITHUB_OUTPUT"
+          echo "bytes=${stored}" >> "$GITHUB_OUTPUT"
+          echo "Data branch at ${data_sha}: ${stored} bytes under runs/."
+
+      - name: Add semver from the pinned commit's lockfile, checked against its integrity
+        run: |
+          set -euo pipefail
+          entry='.packages["node_modules/semver"]'
+          jq -e "${entry}.dependencies == null" app/package-lock.json > /dev/null
+          url=$(jq -r "${entry}.resolved" app/package-lock.json)
+          integrity=$(jq -r "${entry}.integrity" app/package-lock.json)
+          [[ "$url" =~ ^https://registry\.npmjs\.org/semver/-/semver-[0-9]+\.[0-9]+\.[0-9]+\.tgz$ ]]
+          curl --fail --silent --show-error --proto '=https' --max-redirs 0 --max-filesize 10485760 -o semver.tgz "$url"
+          got="sha512-$(openssl dgst -sha512 -binary semver.tgz | base64 -w0)"
+          if [ "$got" != "$integrity" ]; then
+            echo "::error::semver's tarball does not match the lockfile's integrity."
+            exit 1
+          fi
+          mkdir -p app/node_modules/semver
+          tar -xzf semver.tgz -C app/node_modules/semver --strip-components=1 --no-same-owner
+
+      - name: Record
+        id: record
+        env:
+          STORED: ${{ steps.stored.outputs.bytes }}
+          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          # Docker Hub may refuse a pull for its rate limit; a run that cannot pull fails, and the next hour tries again.
+          for attempt in 1 2 3; do
+            if docker pull --quiet "$IMAGE" > /dev/null; then break; fi
+            if [ "$attempt" = 3 ]; then echo "::error::Could not pull ${IMAGE}."; exit 1; fi
+            sleep 60
+          done
+          docker run -d --name ludion-shadow --read-only --tmpfs /tmp --user "$(id -u):$(id -g)" \
+            --memory 2g --cpus 1 --cap-drop ALL --security-opt no-new-privileges -e HOME=/tmp \
+            -v "$GITHUB_WORKSPACE/app:/app:ro" -v "$GITHUB_WORKSPACE/shadow/src:/driver:ro" \
+            -v "$GITHUB_WORKSPACE/data:/data" \
+            "$IMAGE" node /driver/record.ts /app/tools/shadow/src/recorder.ts /data "$MAX_BYTES" "$STORED" "$RECORD_SECONDS" "$RECORDER_COMMIT" "$RUN" > /dev/null
+          # A poll that is still running at the deadline may finish; one that runs 25 minutes past it is cut off, as a
+          # crash would (the replay deduplicates records repeated after a crash).
+          if code=$(timeout $((RECORD_SECONDS + 1500)) docker wait ludion-shadow); then :; else
+            echo "::warning::The recorder was still running 25 minutes after its deadline and was stopped."
+            docker kill ludion-shadow > /dev/null
+            code=$(docker wait ludion-shadow)
+          fi
+          docker logs ludion-shadow 2>&1 | tail -n 20
+          echo "exit=${code}" >> "$GITHUB_OUTPUT"
+
+      # This run's lines move under runs/<UTC day>/<time>-<run id>-<attempt>/; the artifact holds them, state.json
+      # and every known/ file that changed. Each attempt has its own artifact, so a re-run commits its own.
+      - name: Pack what the recorder wrote
+        id: pack
+        if: ${{ !cancelled() && steps.record.outcome == 'success' }}
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y-%m-%d)/$(date -u +%H%M%S)Z-${RUN_ID}-${RUN_ATTEMPT}"
+          mkdir -p "data/runs/${stamp}"
+          for kind in captures osv status; do
+            if [ -d "data/${kind}" ]; then mv "data/${kind}" "data/runs/${stamp}/"; fi
+          done
+          # state.json always, so that an hour in which it did not change still commits its lines.
+          git --git-dir=data.git --work-tree=data ls-files -z -m -o --exclude-standard > changed.list
+          { printf 'state.json\0'; grep -zv -e '\.tmp$' -e '^state\.json$' changed.list || true; } > files.list
+          tar --null --no-recursion -C data -T files.list -cf shadow.tar
+          echo "$(tr -cd '\0' < files.list | wc -c) files, $(stat -c %s shadow.tar) bytes."
+          echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+          echo "artifact=shadow-run-${RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "packed=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ steps.pack.outcome == 'success' }}
+        with:
+          name: ${{ steps.pack.outputs.artifact }}
+          path: shadow.tar
+          retention-days: 1
+          if-no-files-found: error
+
+      # 3: stopped at the storage limit. 4: no poll succeeded in this run. Either fails the run visibly, after the
+      # write job has committed what was recorded.
+      - name: Fail unless the recorder reached its deadline
+        if: ${{ !cancelled() }}
+        env:
+          CODE: ${{ steps.record.outputs.exit }}
+        run: |
+          case "$CODE" in
+            0) echo "The recorder reached its deadline." ;;
+            3) echo "::error::The recorder stopped at its storage limit."; exit 1 ;;
+            4) echo "::error::No poll succeeded in this run."; exit 1 ;;
+            *) echo "::error::The recorder exited with ${CODE:-no code}."; exit 1 ;;
+          esac
+
+  write:
+    needs: record
+    if: ${{ !cancelled() && needs.record.outputs.packed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Reads this run's artifact (actions); the only write is the push to the data branch (contents).
+      actions: read
+      contents: write
+    steps:
+      # Only state.json is downloaded; known/ and runs/ are added outside the sparse checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DATA_BRANCH }}
+          path: data
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /state.json
+
+      - name: Check the run's files and commit them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          STAMP: ${{ needs.record.outputs.stamp }}
+          ARTIFACT: ${{ needs.record.outputs.artifact }}
+          DATA_SHA: ${{ needs.record.outputs.data_sha }}
+        run: |
+          set -euo pipefail
+          day='[0-9]{4}-[0-9]{2}-[0-9]{2}'
+          if ! [[ "$STAMP" =~ ^${day}/[0-9]{6}Z-${RUN_ID}-([0-9]+)$ ]] || [ "$ARTIFACT" != "shadow-run-${BASH_REMATCH[1]}" ]; then
+            echo "::error::Unexpected run directory or artifact: ${STAMP}, ${ARTIFACT}"
+            exit 1
+          fi
+          head=$(git -C data rev-parse HEAD)
+          if [ "$head" != "$DATA_SHA" ]; then
+            echo "::error::The data branch moved from ${DATA_SHA} to ${head} after the record job read it. Nothing committed."
+            exit 1
+          fi
+          if git -C data cat-file -e "HEAD:runs/${STAMP}" 2> /dev/null; then
+            echo "::error::runs/${STAMP} is already on the data branch. Nothing committed."
+            exit 1
+          fi
+
+          artifact=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?name=${ARTIFACT}" \
+            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last // empty | "\(.id) \(.size_in_bytes)"')
+          if [ -z "$artifact" ]; then
+            echo "::error::Run ${RUN_ID} has no ${ARTIFACT} artifact."
+            exit 1
+          fi
+          read -r artifact_id size <<< "$artifact"
+          if [ "$size" -gt 1073741824 ]; then
+            echo "::error::The artifact is ${size} bytes. Nothing committed."
+            exit 1
+          fi
+          gh api "repos/${REPO}/actions/artifacts/${artifact_id}/zip" > artifact.zip
+          unzip -p artifact.zip shadow.tar | head -c 4294967296 > shadow.tar
+
+          # Regular files only, at the recorder's own paths. tar lists names with escapes, so a name cannot add a line.
+          tar -tvf shadow.tar > listing.txt
+          tar -tf shadow.tar > files.txt
+          if grep -qv '^-' listing.txt; then
+            echo "::error::The artifact holds something other than regular files. Nothing committed."
+            exit 1
+          fi
+          hex='[0-9a-f]'
+          allowed="^(state\.json|known/(created/)?${hex}{2}/${hex}{64}\.json|runs/${STAMP}/(captures|osv|status)/${day}\.jsonl)$"
+          if grep -Evq "$allowed" files.txt; then
+            echo "::error::The artifact holds a path the recorder does not write:"
+            grep -Ev "$allowed" files.txt | head -n 5
+            exit 1
+          fi
+          if ! grep -qx 'state.json' files.txt; then
+            echo "::error::The artifact holds no state.json. Nothing committed."
+            exit 1
+          fi
+          mkdir staging
+          tar -xf shadow.tar -C staging --no-same-owner --no-same-permissions
+          if ! jq -e 'type == "object" and (.seq | type == "string") and (.feed_started_at | type == "string")' staging/state.json > /dev/null; then
+            echo "::error::The artifact's state.json has no feed position and feed start. Nothing committed."
+            exit 1
+          fi
+          cp -R staging/. data/
+
+          cd data
+          git --literal-pathspecs add --sparse --pathspec-from-file=../files.txt
+          if git diff --cached --quiet; then
+            echo "Run ${STAMP} changed nothing on the data branch. Nothing committed."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "shadow: run ${STAMP}"
+          git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"
+          echo "Committed runs/${STAMP}: $(wc -l < ../files.txt) files."
