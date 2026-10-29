@@ -23,7 +23,10 @@ The recorder is Ludion's own (`tools/shadow/src/recorder.ts` in [Ludion-ai/ludio
   - each run's lines under `runs/<UTC day>/<HHMMSS>Z-<run id>-<attempt>/{captures,osv,status}/<UTC day>.jsonl`;
   - the seeded lines under `runs/pc-8a78b55/`, cut into `<day>.partNN.jsonl` where a file passes 50,000,000 bytes.
 
-  A reader takes every `*.jsonl` under every `runs/**/<kind>/`, in name order. The time in a run's directory name is when it was packed; each record carries its own times.
+  A reader takes every `*.jsonl` under every `runs/**/<kind>/` and orders the records by their own times (`fetched_at`, `at`).
+  - **Not by name.** `runs/pc-8a78b55/`, the oldest data, sorts after every `runs/2026-…`.
+  - **Within one seeded kind,** the `partNN` files are in name order.
+  - **The time in a run's directory name** is when the run was packed.
 - **What is rewritten.** Only `state.json` and the `known/` files of names that changed. A run's lines are new files, so no file grows from commit to commit.
 - **The storage limit.** 3,800,000,000 bytes, counted over every file on the branch, uncompressed (docs/estimate.md).
   - **How it is counted.** The recorder counts `state.json` and `known/` on disk. The record job adds the size of everything under `runs/`, read from GitHub's recursive listing of that subtree alone. `known/` grows by about 50 files an hour, so a listing of the whole branch could pass GitHub's listing limits (100,000 entries, 7 MB); `runs/` grows by about 7 entries an hour.
@@ -37,11 +40,12 @@ The recorder is Ludion's own (`tools/shadow/src/recorder.ts` in [Ludion-ai/ludio
   - a run directory or artifact name that is not this run's attempt;
   - a data branch that moved after the record job read it;
   - a run directory already on the branch;
+  - a branch that was deleted or moved by the time it pushes (it reads the branch again just before the push);
   - an artifact over 1 GiB;
   - anything but regular files at the recorder's own paths (`state.json`, `known/…/<sha256>.json`, this run's `runs/…/<kind>/<day>.jsonl`);
   - an artifact without a `state.json` that has a feed position and a feed start.
 
-  It pushes only `HEAD:refs/heads/shadow-data`.
+  It pushes only `HEAD:refs/heads/shadow-data`, and never with force.
 - **Pushes start nothing.** GitHub does not start workflows for events made with the workflow's own token, apart from `workflow_dispatch` and `repository_dispatch`.
 - **No secret** and no other credential.
 
@@ -60,10 +64,10 @@ The recorder is Ludion's own (`tools/shadow/src/recorder.ts` in [Ludion-ai/ludio
 - **Re-runs.** Each attempt uploads its own artifact (`shadow-run-<attempt>`), so re-running a failed job commits that attempt's own files.
 - **Gaps.** A failed or dropped run loses no feed entry: the next run resumes from the committed `state.json`. A version removed within the gap cannot be captured.
 - **Days.** A UTC day with no successful poll still restarts the counted four weeks (the counting decision, section 2).
-- **Inactivity.** GitHub disables scheduled workflows in a public repository after 60 days with no repository activity. Whether this workflow's own commits count as activity is unknown. The shadow's 42 days are inside that.
+- **Inactivity.** GitHub disables scheduled workflows in a public repository after 60 days with no repository activity. Whether this workflow's own commits count as activity is unknown. The shadow's 42 days are inside that, but only if the four weeks never restart. If the shadow runs longer, someone must act on the repository before day 60, for example by merging a pull request.
 
 ## What differs from a recorder that polls every minute
 
-- **Capture lag.** Polls run for 50 minutes of each hour, and a scheduled run can start late. So a version can wait about 10 minutes, plus the job's setup and any delay in the schedule, before its first capture. A version removed in that time is a capture gap.
+- **Capture lag.** Polls run for 50 minutes of each hour, and a scheduled run can start late. So a version can wait about 10 minutes, plus the job's setup and any delay in the schedule, before its first capture. A version removed in that time is a capture gap. That gap has a cost: under the counting decision (section 6), a capture gap on a confirmed malicious version, or on a record-omission candidate, counts as a miss for condition (b).
 - **Clock.** `fetched_at` comes from the runner's clock.
 - **Unchanged.** The recorder's code, the watched list, the hosts it may ask, what it stores, how it removes e-mail addresses, and its retries.

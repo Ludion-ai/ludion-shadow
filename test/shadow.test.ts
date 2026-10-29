@@ -8,7 +8,7 @@
 // The script tests need bash, git, jq, tar and unzip; with CI set, a missing one fails them instead of skipping.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
@@ -82,6 +82,7 @@ describe("shadow.yml", () => {
     assert.doesNotMatch(write, /\bnode\b|\bnpm\b|\bnpx\b|\bdocker\b|setup-node|src\/record/);
     assert.deepEqual(uses(write), ["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"]);
     assert.deepEqual(write.match(/git push.*$/gm), ['git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"']);
+    assert.doesNotMatch(write, /--force|\+HEAD|\+refs/);
   });
   it("has no step that makes a branch; the checkouts and the guard below refuse a missing or foreign one", () => {
     assert.doesNotMatch(code(SHADOW), /--orphan|checkout -b|switch -c|git init|git branch/);
@@ -158,20 +159,25 @@ describe("shadow.yml's scripts, against a local data branch", { skip: !tools && 
     return { ...r, output, w, value: (key: string) => new RegExp(`^${key}=(.*)$`, "m").exec(output)?.[1] ?? "" };
   }
   /** The writer's checkout (sparse /state.json, blobless), then its step, with `zipFile` served as `artifact`. */
-  function writeStep(b: Branch, tarFile: string, opts: { stamp?: string; runId?: string; artifact?: string; dataSha?: string } = {}) {
+  function writeStep(b: Branch, tarFile: string, opts: { stamp?: string; runId?: string; artifact?: string; dataSha?: string; beforeStep?: () => void } = {}) {
     const artifact = opts.artifact ?? "shadow-run-1";
     writeFileSync(join(b.fake, `${artifact}.zip`), zip("shadow.tar", readFileSync(tarFile)));
     const w = mkdtempSync(join(b.fake, "w-"));
     ok(`git clone -q --depth 1 --filter=blob:none --no-checkout --branch shadow-data ${b.url} data
       git -C data sparse-checkout set --no-cone /state.json && git -C data checkout -q shadow-data`, w);
-    return sh(step("Check the run's files and commit them"), w, { ...b.env, RUN_ID: opts.runId ?? "777", STAMP: opts.stamp ?? STAMP, ARTIFACT: artifact, DATA_SHA: opts.dataSha ?? b.head(), DATA_BRANCH: "shadow-data" });
+    const dataSha = opts.dataSha ?? b.head();
+    opts.beforeStep?.();
+    return sh(step("Check the run's files and commit them"), w, { ...b.env, RUN_ID: opts.runId ?? "777", STAMP: opts.stamp ?? STAMP, ARTIFACT: artifact, DATA_SHA: dataSha, DATA_BRANCH: "shadow-data" });
   }
-  /** Packs `files` (text, or { link } for a symbolic link) as tar and runs the writer on it. */
-  function write(b: Branch, files: Record<string, string | { link: string }>, opts: Parameters<typeof writeStep>[2] = {}) {
+  type Entry = string | { link: string } | { hardlink: string };
+  /** Packs `files` (text, { link } for a symbolic link, { hardlink } for a hard link) as tar and runs the writer on it. */
+  function write(b: Branch, files: Record<string, Entry>, opts: Parameters<typeof writeStep>[2] = {}) {
     const src = mkdtempSync(join(b.fake, "src-"));
     for (const [path, v] of Object.entries(files)) {
       mkdirSync(join(src, path, ".."), { recursive: true });
-      if (typeof v === "string") writeFileSync(join(src, path), v); else symlinkSync(v.link, join(src, path));
+      if (typeof v === "string") writeFileSync(join(src, path), v);
+      else if ("link" in v) symlinkSync(v.link, join(src, path));
+      else linkSync(join(src, v.hardlink), join(src, path));
     }
     const tar = join(b.fake, `${src.split(/[\\/]/).pop()}.tar`);
     ok(`tar -C '${src}' -cf '${tar}' ${Object.keys(files).map(f => `'${f}'`).join(" ")}`, b.fake);
@@ -192,11 +198,12 @@ describe("shadow.yml's scripts, against a local data branch", { skip: !tools && 
       assert.equal(r.status, 0, r.out);
       assert.ok(b.tree().includes(`runs/${STAMP}/status/2026-10-30.jsonl`));
     });
-    const refused: [string, Record<string, string | { link: string }>, RegExp][] = [
+    const refused: [string, Record<string, Entry>, RegExp][] = [
       ["a path the recorder never writes", { "state.json": STATE, ".github/workflows/x.yml": "on: push" }, /::error::The artifact holds a path the recorder does not write:\n\.github\/workflows\/x\.yml/],
       ["another run's directory", { "state.json": STATE, "runs/2026-10-30/101500Z-778-1/status/2026-10-30.jsonl": "{}\n" }, /::error::The artifact holds a path the recorder does not write/],
       ["a .tmp leftover", { "state.json": STATE, "state.json.tmp": "{}" }, /::error::The artifact holds a path the recorder does not write/],
       ["a symbolic link at a known/ path", { "state.json": STATE, [KNOWN]: { link: "/etc/passwd" } }, /::error::The artifact holds something other than regular files/],
+      ["a hard link", { "state.json": STATE, [KNOWN]: { hardlink: "state.json" } }, /::error::The artifact holds something other than regular files/],
       ["no state.json", { [`runs/${STAMP}/status/2026-10-30.jsonl`]: "{}\n" }, /::error::The artifact holds no state\.json/],
       ["a state.json that is not an object", { "state.json": "[]" }, /::error::The artifact's state\.json has no feed position and feed start/],
       ["a state.json without a feed start", { "state.json": '{"seq":"9","feed_started_at":null}' }, /::error::The artifact's state\.json has no feed position and feed start/],
@@ -217,6 +224,18 @@ describe("shadow.yml's scripts, against a local data branch", { skip: !tools && 
       assert.match(write(b, files, { artifact: "shadow-run-1; x" }).out, /::error::Unexpected run directory or artifact/);
       assert.match(write(b, files, { dataSha: "0".repeat(40) }).out, /::error::The data branch moved from 0{40}/);
       assert.equal(b.head(), before);
+    });
+    it("refuses a run directory that is already on the branch", () => {
+      const b = branch({ [`runs/${STAMP}/status/2026-10-30.jsonl`]: "{}\n" }), before = b.head();
+      assert.match(write(b, { "state.json": STATE }).out, /::error::runs\/2026-10-30\/101500Z-777-1 is already on the data branch/);
+      assert.equal(b.head(), before);
+    });
+    it("does not re-create a branch deleted while the write job ran", () => {
+      const b = branch();
+      const r = write(b, { "state.json": STATE, [`runs/${STAMP}/status/2026-10-30.jsonl`]: "{}\n" }, { beforeStep: () => ok("git -C remote.git branch -D shadow-data", b.fake) });
+      assert.notEqual(r.status, 0, r.out);
+      assert.match(r.out, /::error::The data branch is at '', not [0-9a-f]{40}\. Nothing pushed\./);
+      assert.equal(ok("git -C remote.git branch --list shadow-data", b.fake), "");
     });
     it("commits a re-run's own artifact: attempt 2 with shadow-run-2", () => {
       const b = branch(), stamp = "2026-10-30/111500Z-777-2";

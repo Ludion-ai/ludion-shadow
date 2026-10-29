@@ -167,7 +167,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          stamp="$(date -u +%Y-%m-%d)/$(date -u +%H%M%S)Z-${RUN_ID}-${RUN_ATTEMPT}"
+          # One reading of the clock, so that the day and the time cannot straddle midnight.
+          stamp="$(date -u +%Y-%m-%d/%H%M%S)Z-${RUN_ID}-${RUN_ATTEMPT}"
           mkdir -p "data/runs/${stamp}"
           for kind in captures osv status; do
             if [ -d "data/${kind}" ]; then mv "data/${kind}" "data/runs/${stamp}/"; fi
@@ -295,5 +296,12 @@ jobs:
           fi
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit --quiet -m "shadow: run ${STAMP}"
+          # Read the branch again just before the push: a branch deleted meanwhile would otherwise be re-created. (A
+          # deletion between this read and the push is what the branch's "Restrict deletions" rule is for.)
+          remote=$(git ls-remote origin "refs/heads/${DATA_BRANCH}" | cut -f1)
+          if [ "$remote" != "$DATA_SHA" ]; then
+            echo "::error::The data branch is at '${remote}', not ${DATA_SHA}. Nothing pushed."
+            exit 1
+          fi
           git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"
           echo "Committed runs/${STAMP}: $(wc -l < ../files.txt) files."

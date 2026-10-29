@@ -4,7 +4,7 @@ Every figure here is an estimate from one measurement, not a bound, unless it is
 
 ## The measurement it rests on
 
-The container recorder's first 9.35 hours, from 2026-10-28T15:51:48Z to 2026-10-29T01:13:00Z, read without changing anything. The script and its log are in Ludion-ai/ludion, branch `lane/sa-shadow-actions`, `docs/bench/2026-10-29-shadow-actions/` (`scripts/measure-pc.sh`, `logs/measure-pc.log`).
+The container recorder's first 9.35 hours, from 2026-10-28T15:51:48Z to 2026-10-29T01:13:00Z, read without changing anything. The script and its log are in Ludion-ai/ludion at commit `c4512cb99cb518973d2130c65a9a9991c9a5ce53` (reachable as `refs/pull/197/head`): `docs/bench/2026-10-29-shadow-actions/scripts/measure-pc.sh` and `logs/measure-pc.log`.
 
 | | Measured |
 | --- | --- |
@@ -36,7 +36,7 @@ The shadow needs captures for four weeks plus the longest wait, 336 h: about 42 
 
 - **The "every name" rows** cover only the first-seen names, at the measured size per name. The new-version rate could be higher on other days.
 - **The limit.** `MAX_BYTES` is 3,800,000,000. That is 28% over the "every name" case at 42 days; a higher new-version rate eats into the margin.
-- **On disk.** At the gzip ratio, the branch's files take about 0.66 GB (central) to 0.98 GB at 42 days.
+- **On disk.** At the gzip ratios (0.331 for captures, 0.290 for `known/`), the branch's files take about 0.66 GB (central) to 0.97 GB at 42 days.
   - **Rewrites.** Each hourly commit also rewrites `state.json` and the changed `known/` files: about 12 MB a day before git's deltas (441 changes / 9.35 h × 24 × 36,937 B × 0.290), so about 0.5 GB over 42 days. How much git's deltas save on GitHub is unknown.
   - **Total.** About 1.2 to 1.5 GB, against GitHub's recommended 10 GB per repository.
 - **Per file.** A run's files stay far under GitHub's 100 MB per file: about 1.6 MB of new versions an hour. The seed script cuts larger day files at 50,000,000 bytes.
