@@ -32,7 +32,7 @@ From then on, each run that commits starts the next one (the `next` job), and th
 ## If the first run fails
 
 1. **Disable the workflow,** so that no new scheduled run starts: Actions → shadow → ··· → Disable workflow, or `gh workflow disable shadow.yml -R Ludion-ai/ludion-shadow`.
-2. **Cancel every run that is still queued or in progress.** Disabling does not cancel existing runs. A scheduled run is very likely queued behind the first run, and it would commit from the seed state about an hour later. List them:
+2. **Cancel every run that is still queued or in progress.** Disabling does not cancel existing runs. A run's `next` job that is already going can still start one more run after the workflow is disabled, so list them again until none is left. A scheduled run is very likely queued behind the first run, and it would commit from the seed state about an hour later. List them:
 
    ```text
    gh run list -R Ludion-ai/ludion-shadow --workflow shadow.yml --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId'

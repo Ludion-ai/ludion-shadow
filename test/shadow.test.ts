@@ -86,10 +86,11 @@ describe("shadow.yml", () => {
   });
   it("starts the next run only after a successful write, with only the right to start runs, and nothing else", () => {
     const next = job("next");
-    assert.match(next, /\n    needs: write\n    if: \$\{\{ needs\.write\.result == 'success' \}\}\n/);
+    assert.match(next, /\n    needs: \[record, write\]\n    if: \$\{\{ needs\.record\.result == 'success' && needs\.write\.result == 'success' \}\}\n/);
+    assert.doesNotMatch(next, /always\(\)|cancelled\(\)|failure\(\)/);
     assert.deepEqual(permissionsOf(next), ["actions: write"]);
     assert.deepEqual(uses(next), []);
-    assert.deepEqual(next.match(/^ +gh .*$/gm)?.map(l => l.trim()), ['gh api -X POST "repos/${REPO}/actions/workflows/shadow.yml/dispatches" -f ref=main']);
+    assert.deepEqual(next.match(/\bgh [a-z].*$/gm), ['gh api -X POST "repos/${REPO}/actions/workflows/shadow.yml/dispatches" -f ref=main; then exit 0; fi']);
     assert.doesNotMatch(next, /secrets\.|\bnode\b|\bnpm\b|\bdocker\b|checkout/);
   });
   it("has no step that makes a branch; the checkouts and the guard below refuse a missing or foreign one", () => {
