@@ -27,12 +27,12 @@ The shadow's recorder first ran as a Docker container on a machine. Moving it he
    - Its `runs/…/status/*.jsonl` begins with a `start` line naming the pinned commit, `watched_names` 7660 and `stored_bytes`, followed by `poll` lines.
    - The new `state.json` has a larger `seq` than the seeded one, and the same `feed_started_at`.
 
-From then on, the hourly schedule keeps it going. A scheduled run that falls due while the first run is still going waits for it, then starts at once.
+From then on, each run that commits starts the next one (the `next` job), and the hourly schedule is the fallback. On 2026-10-29 the schedule did not fire once between 12:17Z and 17:17Z, and the runs were started by hand until this job existed. A scheduled run that falls due while the first run is still going waits for it, then starts at once.
 
 ## If the first run fails
 
 1. **Disable the workflow,** so that no new scheduled run starts: Actions → shadow → ··· → Disable workflow, or `gh workflow disable shadow.yml -R Ludion-ai/ludion-shadow`.
-2. **Cancel every run that is still queued or in progress.** Disabling does not cancel existing runs. A scheduled run is very likely queued behind the first run, and it would commit from the seed state about an hour later. List them:
+2. **Cancel every run that is still queued or in progress.** Disabling does not cancel existing runs. A run's `next` job that is already going can still start one more run after the workflow is disabled, so list them again until none is left. A scheduled run is very likely queued behind the first run, and it would commit from the seed state about an hour later. List them:
 
    ```text
    gh run list -R Ludion-ai/ludion-shadow --workflow shadow.yml --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId'

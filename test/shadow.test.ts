@@ -84,6 +84,15 @@ describe("shadow.yml", () => {
     assert.deepEqual(write.match(/git push.*$/gm), ['git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"']);
     assert.doesNotMatch(write, /--force|\+HEAD|\+refs/);
   });
+  it("starts the next run only after a successful write, with only the right to start runs, and nothing else", () => {
+    const next = job("next");
+    assert.match(next, /\n    needs: \[record, write\]\n    if: \$\{\{ needs\.record\.result == 'success' && needs\.write\.result == 'success' \}\}\n/);
+    assert.doesNotMatch(next, /always\(\)|cancelled\(\)|failure\(\)/);
+    assert.deepEqual(permissionsOf(next), ["actions: write"]);
+    assert.deepEqual(uses(next), []);
+    assert.deepEqual(next.match(/\bgh [a-z].*$/gm), ['gh api -X POST "repos/${REPO}/actions/workflows/shadow.yml/dispatches" -f ref=main; then exit 0; fi']);
+    assert.doesNotMatch(next, /secrets\.|\bnode\b|\bnpm\b|\bdocker\b|checkout/);
+  });
   it("has no step that makes a branch; the checkouts and the guard below refuse a missing or foreign one", () => {
     assert.doesNotMatch(code(SHADOW), /--orphan|checkout -b|switch -c|git init|git branch/);
   });

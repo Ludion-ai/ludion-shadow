@@ -4,13 +4,14 @@
 # workflow never creates: until the branch is seeded (docs/switch-over.md), every run fails at the checkout, and no
 # new shadow starts by accident.
 #
-# Two jobs:
+# Three jobs:
 # - record: read-only token, no secret. Runs the recorder in Docker (node:24-slim by digest) for RECORD_SECONDS, then
 #   uploads what it wrote as an artifact. It is the only job that runs Node, and it runs no dependency code but semver,
 #   checked against the pinned commit's lockfile integrity. No package tarball is ever run or stored.
 # - write: may push to DATA_BRANCH only by what it does (the token can write contents). Runs no Node, npm or Docker:
 #   it checks the artifact's paths and file types, then commits and pushes it. It refuses a run whose data branch
 #   moved since the record job read it.
+# - next: after both succeeded, starts the next run (workflow_dispatch); actions: write only, runs nothing else.
 # Pushes made with the workflow's token start no other workflow.
 name: shadow
 
@@ -305,3 +306,31 @@ jobs:
           fi
           git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"
           echo "Committed runs/${STAMP}: $(wc -l < ../files.txt) files."
+
+  # GitHub's schedule did not fire once in the first hours on 2026-10-29 (12:17Z to 17:17Z), so each run that commits
+  # starts the next one. A workflow_dispatch made with the workflow's own token is the documented exception that does
+  # start a run. Only after the write job succeeded: a failed run stops the chain, and the schedule stays as the
+  # fallback. Both jobs must have succeeded: write also commits after a failed record (exit 3 at the storage limit,
+  # exit 4 with no successful poll), and continuing then would loop or carry on through an outage. The concurrency
+  # group above makes the next run wait until this one has finished. Runs nothing else.
+  next:
+    needs: [record, write]
+    if: ${{ needs.record.result == 'success' && needs.write.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Three tries: a failed call would leave the chain to the schedule alone.
+          for attempt in 1 2 3; do
+            if gh api -X POST "repos/${REPO}/actions/workflows/shadow.yml/dispatches" -f ref=main; then exit 0; fi
+            sleep $((attempt * 20))
+          done
+          echo "::error::The next run could not be started. The schedule is the fallback; start one by hand."
+          exit 1
