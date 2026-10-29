@@ -5,3 +5,10 @@ This repository runs the scheduled part of [Ludion](https://github.com/Ludion-ai
 - **No secrets.** The workflows use only the token GitHub gives each run, and hold no other credential.
 - **Public data only.** What it stores is public registry data: package names, versions, publish times, manifests without e-mail addresses, attestations and file lists. No project's source or usage is sent or kept here.
 - **Where the data goes.** The branch `shadow-data`, not `main`.
+
+The workflow is `.github/workflows/shadow.yml`. To learn more:
+- how it works: [docs/design.md](docs/design.md);
+- how the recorder moves here, and back if needed: [docs/switch-over.md](docs/switch-over.md);
+- what it costs and stores: [docs/estimate.md](docs/estimate.md).
+
+Tests run on every pull request (`.github/workflows/test.yml`).

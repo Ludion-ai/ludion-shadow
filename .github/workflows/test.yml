@@ -1,0 +1,67 @@
+# Tests for every pull request: the shadow workflow's shape, its own shell steps run against a local repository, and
+# the driver against the pinned recorder. Read-only, no secret. Node's own test runner; no dependency is installed but
+# the recorder's semver, checked the same way the shadow workflow checks it.
+name: test
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The recorder at the commit the shadow workflow pins (read from that file).
+      - name: Read the pinned recorder commit
+        id: pin
+        run: |
+          set -euo pipefail
+          echo "repository=$(sed -n 's/^  RECORDER_REPOSITORY: \(.*\)$/\1/p' .github/workflows/shadow.yml)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(sed -n 's/^  RECORDER_COMMIT: \([0-9a-f]\{40\}\)$/\1/p' .github/workflows/shadow.yml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: app
+          persist-credentials: false
+          sparse-checkout: |
+            tools/shadow
+            tools/backtest/src
+            packages/cli/src/security
+
+      - name: Add semver from the pinned commit's lockfile, checked against its integrity
+        run: |
+          set -euo pipefail
+          entry='.packages["node_modules/semver"]'
+          jq -e "${entry}.dependencies == null" app/package-lock.json > /dev/null
+          url=$(jq -r "${entry}.resolved" app/package-lock.json)
+          integrity=$(jq -r "${entry}.integrity" app/package-lock.json)
+          [[ "$url" =~ ^https://registry\.npmjs\.org/semver/-/semver-[0-9]+\.[0-9]+\.[0-9]+\.tgz$ ]]
+          curl --fail --silent --show-error --proto '=https' --max-redirs 0 --max-filesize 10485760 -o semver.tgz "$url"
+          got="sha512-$(openssl dgst -sha512 -binary semver.tgz | base64 -w0)"
+          if [ "$got" != "$integrity" ]; then
+            echo "::error::semver's tarball does not match the lockfile's integrity."
+            exit 1
+          fi
+          mkdir -p app/node_modules/semver
+          tar -xzf semver.tgz -C app/node_modules/semver --strip-components=1 --no-same-owner
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Test
+        env:
+          SHADOW_APP: app
+          CI: "true"
+        run: node --test --test-reporter=spec test/shadow.test.ts
