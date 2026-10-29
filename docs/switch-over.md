@@ -27,7 +27,7 @@ The shadow's recorder first ran as a Docker container on a machine. Moving it he
    - Its `runs/…/status/*.jsonl` begins with a `start` line naming the pinned commit, `watched_names` 7660 and `stored_bytes`, followed by `poll` lines.
    - The new `state.json` has a larger `seq` than the seeded one, and the same `feed_started_at`.
 
-From then on, the hourly schedule keeps it going. A scheduled run that falls due while the first run is still going waits for it, then starts at once.
+From then on, each run that commits starts the next one (the `next` job), and the hourly schedule is the fallback. On 2026-10-29 the schedule did not fire once between 12:17Z and 17:17Z, and the runs were started by hand until this job existed. A scheduled run that falls due while the first run is still going waits for it, then starts at once.
 
 ## If the first run fails
 

@@ -305,3 +305,23 @@ jobs:
           fi
           git push --quiet origin "HEAD:refs/heads/${DATA_BRANCH}"
           echo "Committed runs/${STAMP}: $(wc -l < ../files.txt) files."
+
+  # GitHub's schedule did not fire once in the first hours on 2026-10-29 (12:17Z to 17:17Z), so each run that commits
+  # starts the next one. A workflow_dispatch made with the workflow's own token is the documented exception that does
+  # start a run. Only after the write job succeeded: a failed run stops the chain, and the schedule stays as the
+  # fallback. The concurrency group above makes the next run wait until this one has finished. Runs nothing else.
+  next:
+    needs: write
+    if: ${{ needs.write.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPO}/actions/workflows/shadow.yml/dispatches" -f ref=main
